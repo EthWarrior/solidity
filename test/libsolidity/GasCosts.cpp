@@ -131,7 +131,7 @@ BOOST_AUTO_TEST_CASE(string_storage)
 	{
 		callContractFunction("f()");
 		if (evmVersion == EVMVersion::byzantium())
-			CHECK_GAS(21545, 21526, 20);
+			CHECK_GAS(21712, 21555, 20);
 		// This is only correct on >=Constantinople.
 		else if (!CommonOptions::get().useABIEncoderV1)
 		{
