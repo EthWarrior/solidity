@@ -1695,7 +1695,8 @@ string YulUtilFunctions::copyValueArrayStorageToStorageFunction(ArrayType const&
 	solAssert(_fromType.dataStoredIn(DataLocation::Storage) && _toType.baseType()->isValueType(), "");
 	solAssert(_toType.dataStoredIn(DataLocation::Storage), "");
 
-	solUnimplementedAssert(_fromType.storageStride() == _toType.storageStride(), "");
+	solAssert(_fromType.storageStride() <= _toType.storageStride(), "");
+	solAssert(_toType.storageStride() <= 32, "");
 
 	string functionName = "copy_array_to_storage_from_" + _fromType.identifier() + "_to_" + _toType.identifier();
 	return m_functionCollector.createFunction(functionName, [&](){
@@ -1707,19 +1708,64 @@ string YulUtilFunctions::copyValueArrayStorageToStorageFunction(ArrayType const&
 				if gt(length, 0xffffffffffffffff) { <panic>() }
 				<resizeArray>(dst, length)
 
-				let srcPtr := <srcDataLocation>(src)
-
-				let dstPtr := <dstDataLocation>(dst)
+				let srcSlot := <srcDataLocation>(src)
+				let dstSlot := <dstDataLocation>(dst)
 
 				let fullSlots := div(length, <itemsPerSlot>)
-				let i := 0
-				for { } lt(i, fullSlots) { i := add(i, 1) } {
-					sstore(add(dstPtr, i), <maskFull>(sload(add(srcPtr, i))))
-				}
-				let spill := sub(length, mul(i, <itemsPerSlot>))
-				if gt(spill, 0) {
-					sstore(add(dstPtr, i), <maskBytes>(sload(add(srcPtr, i)), mul(spill, <bytesPerItem>)))
-				}
+				let spill := sub(length, mul(fullSlots, <itemsPerSlot>))
+
+				<?sameStride>
+					let i := 0
+					for { } lt(i, fullSlots) { i := add(i, 1) } {
+						sstore(add(dstSlot, i), <maskFull>(sload(add(srcSlot, i))))
+					}
+					if gt(spill, 0) {
+						sstore(add(dstSlot, i), <maskBytes>(sload(add(srcSlot, i)), mul(spill, <dstStride>)))
+					}
+				<!sameStride>
+					let srcSlotValue := sload(srcSlot)
+					let srcItemIndexInSlot := 0
+					let totalSlots := fullSlots
+					if gt(spill, 0) {
+						totalSlots := add(totalSlots, 1)
+					}
+					for { let i := 0 } lt(i, totalSlots) { i := add(i, 1) } {
+						let dstSlotValue := 0
+						let itemsInSlot := <itemsPerSlot>
+						if eq(i, fullSlots) { itemsInSlot := spill }
+						for { let j := 0 } lt(j, itemsInSlot) { j := add(j, 1) } {
+							let itemValue := <convert>(
+								<?leftAligned>
+									<srcAlignLeft>(and(srcSlotValue, <srcMask>)))
+								<!leftAligned>
+									and(srcSlotValue, <srcMask>))
+								</leftAligned>
+							dstSlotValue := or(
+								dstSlotValue,
+								<?leftAligned>
+									<shiftRightDyn>(sub(256, mul(add(j, 1), mul(<dstStride>, 8))), itemValue)
+								<!leftAligned>
+									<shiftLeftDyn>(mul(j, mul(<dstStride>, 8)), itemValue)
+								</leftAligned>
+							)
+
+							<?srcMultiItemsInSlot>
+								srcSlotValue := <shiftRightSrc>(srcSlotValue)
+								srcItemIndexInSlot := add(srcItemIndexInSlot, 1)
+								if eq(srcItemIndexInSlot, <srcItemsPerSlot>) {
+									// here we are done with this slot, we need to read next one
+									srcSlot := add(srcSlot, 1)
+									srcSlotValue := sload(srcSlot)
+									srcItemIndexInSlot := 0
+								}
+							<!srcMultiItemsInSlot>
+								srcSlot := add(srcSlot, 1)
+								srcSlotValue := sload(srcSlot)
+							</srcMultiItemsInSlot>
+						}
+						sstore(add(dstSlot, i), dstSlotValue)
+					}
+				</sameStride>
 			}
 		)");
 		if (_fromType.dataStoredIn(DataLocation::Storage))
@@ -1730,11 +1776,32 @@ string YulUtilFunctions::copyValueArrayStorageToStorageFunction(ArrayType const&
 		templ("panic", panicFunction());
 		templ("srcDataLocation", arrayDataAreaFunction(_fromType));
 		templ("dstDataLocation", arrayDataAreaFunction(_toType));
+		templ("sameStride", _fromType.storageStride() == _toType.storageStride());
 		unsigned itemsPerSlot = 32 / _toType.storageStride();
 		templ("itemsPerSlot", to_string(itemsPerSlot));
-		templ("bytesPerItem", to_string(_toType.storageStride()));
-		templ("maskFull", maskLowerOrderBytesFunction(itemsPerSlot * _toType.storageStride()));
-		templ("maskBytes", maskLowerOrderBytesFunctionDynamic());
+		templ("dstStride", to_string(_toType.storageStride()));
+		if (_fromType.storageStride() == _toType.storageStride())
+		{
+			templ("maskFull", maskLowerOrderBytesFunction(itemsPerSlot * _toType.storageStride()));
+			templ("maskBytes", maskLowerOrderBytesFunctionDynamic());
+		}
+		else
+		{
+			bool leftAligned =  _fromType.storageStride() < 32 && _fromType.baseType()->leftAligned();
+			templ("convert", conversionFunction(*_fromType.baseType(), *_toType.baseType()));
+			templ("leftAligned", leftAligned);
+			templ("srcMask", (~u256(0) >> (256 - 8 * _fromType.storageStride())).str());
+			if (leftAligned)
+			{
+				templ("srcAlignLeft", shiftLeftFunction(256 - 8 * _fromType.storageStride()));
+				templ("shiftRightDyn", shiftRightFunctionDynamic());
+			}
+			else
+				templ("shiftLeftDyn", shiftLeftFunctionDynamic());
+			templ("srcMultiItemsInSlot", _fromType.storageStride() <= 16);
+			templ("srcItemsPerSlot", to_string(32 / _fromType.storageStride()));
+			templ("shiftRightSrc", shiftRightFunction(_fromType.storageStride() * 8));
+		}
 
 		return templ.render();
 	});
